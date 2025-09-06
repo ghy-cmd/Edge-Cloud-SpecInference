@@ -179,12 +179,11 @@ class SpecDecodeBaseSampler(nn.Module):
 
         # validate the shape of draft probs if it is set
         if draft_probs is not None:
-            (draft_batch_size, num_draft_probs,
-             draft_vocab_size) = draft_probs.shape
+            # For optimization, draft_probs has shape [batch_size, num_target_probs]
+            # instead of [batch_size, num_target_probs, vocab_size]
+            (draft_batch_size, num_draft_probs) = draft_probs.shape
             assert draft_batch_size == target_batch_size
             assert num_draft_probs == num_target_probs
-            assert (draft_vocab_size == target_vocab_size
-                    ), f"{draft_vocab_size=} {target_vocab_size=}"
 
     def _raise_if_incorrect_dtype(
         self,
@@ -256,4 +255,30 @@ class SpecDecodeStochasticBaseSampler(SpecDecodeBaseSampler):
         draft_token_ids: torch.Tensor,
         seeded_seqs: Optional[dict[int, torch.Generator]] = None,
     ) -> torch.Tensor:
+        """Sample token ids using rejection sampling or other stochastic methods.
+
+        Args:
+            target_with_bonus_probs: The probability distribution 
+                over token ids given context according to the target model.
+                shape = [batch_size, num_speculative_tokens + 1, vocab_size]
+            bonus_token_ids: The "bonus" token ids that are accepted iff all
+                speculative tokens in a sequence are accepted.
+                shape = [batch_size, num_bonus_tokens]
+            draft_probs: The probability distribution over token ids given
+                context according to the draft model. For optimization, 
+                we only keep probabilities for the proposed tokens instead 
+                of the full vocabulary distribution.
+                shape = [batch_size, num_speculative_tokens]
+            draft_token_ids: The token ids that were sampled from the draft
+                probabilities.
+                shape = [batch_size, num_speculative_tokens]
+            seeded_seqs: Dict of batch row index to torch generator, for
+                sequences using seeded generation.
+
+        Returns:
+            output_token_ids: The token ids sampled via rejection sampling,
+                or -1 if unable to sample a token because the previous token
+                was rejected.
+                shape = [batch_size, num_speculative_tokens + num_bonus_tokens]
+        """
         raise NotImplementedError

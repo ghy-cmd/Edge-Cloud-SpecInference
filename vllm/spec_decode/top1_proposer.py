@@ -233,11 +233,12 @@ class Top1Proposer(SpeculativeProposer):
                                            dtype=torch.long,
                                            device=self._device).expand(
                                                batch_size, proposal_len)
+            # For optimization, we only keep probabilities for the proposed tokens
+            # instead of the full vocabulary distribution.
             proposal_probs = torch.tensor(0,
                                           dtype=torch.float32,
                                           device=self._device).expand(
-                                              batch_size, proposal_len,
-                                              self._vocab_size)
+                                              batch_size, proposal_len)
             proposal_lens_tensor = torch.tensor(0,
                                                 dtype=torch.long,
                                                 device=self._device).expand(
@@ -248,6 +249,14 @@ class Top1Proposer(SpeculativeProposer):
         proposal_tokens, proposal_probs, *_ = sampler_output_to_torch(
             sampler_output, sampler_transposed)
 
+        # Optimize probability storage: only keep probabilities for the 
+        # proposed tokens instead of the full vocabulary distribution
+        # Get the probabilities of the proposed tokens
+        batch_size_actual, seq_len, vocab_size = proposal_probs.shape
+        proposed_token_indices = proposal_tokens.unsqueeze(-1)  # [batch_size, seq_len, 1]
+        # Gather the probabilities of the proposed tokens
+        proposal_probs_sparse = torch.gather(proposal_probs, -1, proposed_token_indices).squeeze(-1)
+        
         # Now, reformat the output GPU tensors such that each sequence has
         # a proposal. the proposal can be empty, e.g. [-1, -1, -1]
 
@@ -256,11 +265,13 @@ class Top1Proposer(SpeculativeProposer):
             fill_value=-1,
         )
         entire_proposal_tokens[nonzero_proposal_len_indices] = proposal_tokens
-        entire_proposal_probs = proposal_probs.new_zeros(
+        
+        # Use the optimized sparse probabilities
+        entire_proposal_probs = proposal_probs_sparse.new_zeros(
             batch_size,
-            *proposal_probs.shape[1:],
+            *proposal_probs_sparse.shape[1:],
         )
-        entire_proposal_probs[nonzero_proposal_len_indices] = proposal_probs
+        entire_proposal_probs[nonzero_proposal_len_indices] = proposal_probs_sparse
 
         proposal_tokens, proposal_probs = (
             entire_proposal_tokens,

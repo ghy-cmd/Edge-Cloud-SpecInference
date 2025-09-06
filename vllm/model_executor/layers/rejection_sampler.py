@@ -89,8 +89,10 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
             shape = [batch_size, num_bonus_tokens]
 
             draft_probs: The probability distribution over token ids given
-                context according to the draft model.
-            shape = [batch_size, num_speculative_tokens, vocab_size]
+                context according to the draft model. For optimization, 
+                we only keep probabilities for the proposed tokens instead 
+                of the full vocabulary distribution.
+            shape = [batch_size, num_speculative_tokens]
 
             draft_token_ids: The token ids that were sampled from the draft
                 probabilities.
@@ -112,7 +114,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
                                            draft_token_ids, bonus_token_ids,
                                            draft_probs)
 
-        batch_size, k, _ = draft_probs.shape
+        batch_size, k = draft_probs.shape
 
         # batch_size = 0 when all requests in the batch are
         # non_spec requests. In this case, output_token_ids is
@@ -123,7 +125,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
         # If use Flashinfer chain_speculative_sampling kernel
         # for rejection sampling
         if self.use_flashinfer and chain_speculative_sampling is not None:
-            batch_size, k, _ = draft_probs.shape
+            batch_size, k = draft_probs.shape
 
             (output_token_ids, accepted_token_num,
              emitted_token_num) = chain_speculative_sampling(
@@ -161,7 +163,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
     def _batch_modified_rejection_sampling(
         self,
         target_probs: torch.Tensor,  # [batch_size, k, vocab_size]
-        draft_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+        draft_probs: torch.Tensor,  # [batch_size, k] - optimized format
         draft_token_ids: torch.Tensor,  # [batch_size, k]
         seeded_seqs: Optional[dict[int, torch.Generator]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,14 +178,14 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
                 shape = [batch_size, k]
         """
 
-        batch_size, k, vocab_size = draft_probs.shape
+        batch_size, k, vocab_size = target_probs.shape
 
         # shape [batch_size, k]
         accepted = self._get_accepted(target_probs, draft_probs,
                                       draft_token_ids, seeded_seqs)
 
         recovered_probs = self._get_recovered_probs(
-            target_probs, draft_probs).reshape(batch_size * k, vocab_size)
+            target_probs, draft_token_ids, draft_probs).reshape(batch_size * k, vocab_size)
 
         # NOTE: the recovered_probs are overwritten by this method.
         recovered_token_ids = _multinomial(
@@ -255,7 +257,7 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
     def _get_accepted(
         self,
         target_probs: torch.Tensor,  # [batch_size, k, vocab_size]
-        draft_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+        draft_probs: torch.Tensor,  # [batch_size, k] - optimized format
         draft_token_ids: torch.Tensor,  # [batch_size, k]
         seeded_seqs: Optional[dict[int, torch.Generator]],
     ) -> torch.Tensor:
@@ -269,10 +271,10 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
         same conditional probability according to the draft model, the token
         is accepted with probability:
 
-        $$
+        $
         \min\left(1, \frac{q(\hat{x}_{n+1}|x_1, \dots, x_n)}
                         {p(\hat{x}_{n+1}|x_1, \dots, x_n)}\right)
-        $$
+        $
 
         This implementation does not apply causality. When using the output,
         if a token is rejected, subsequent tokens should not be used.
@@ -280,15 +282,15 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
         Returns a bool tensor of shape [batch_size, k] specifying which tokens
         are accepted.
         """
-        batch_size, k, _ = draft_probs.shape
+        batch_size, k, _ = target_probs.shape
         batch_indices = torch.arange(batch_size,
                                      device=target_probs.device)[:, None]
         probs_indicies = torch.arange(k, device=target_probs.device)
 
-        # shape [batch_size, k]
-        selected_draft_probs = draft_probs[batch_indices, probs_indicies,
-                                           draft_token_ids]
-
+        # For the optimized format, draft_probs already contains the probabilities 
+        # of the proposed tokens, so we don't need to gather them
+        selected_draft_probs = draft_probs
+        
         # shape [batch_size, k]
         selected_target_probs = target_probs[batch_indices, probs_indicies,
                                              draft_token_ids]
@@ -305,8 +307,9 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
 
     def _get_recovered_probs(
             self,
-            target_probs: torch.Tensor,  # [k, vocab_size]
-            draft_probs: torch.Tensor,  # [k, vocab_size]
+            target_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+            draft_token_ids: torch.Tensor,  # [batch_size, k]
+            draft_probs: torch.Tensor,  # [batch_size, k] - optimized format
     ) -> torch.Tensor:
         r"""Create a probability distribution for each proposed token which can
         be sampled if the proposed token is rejected.
@@ -320,15 +323,15 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
         model and $p(x|x_1, \dots, x_n)$, the same conditional probability
         according to the draft model:
 
-        $$
+        $
         x_{n+1} \sim (q(x|x_1, \dots, x_n) - p(x|x_1, \dots, x_n))_+
-        $$
+        $
 
         where $(f(x))_+$ is defined as:
 
-        $$
+        $
         (f(x))_+ = \frac{\max(0, f(x))}{\sum_x \max(0, f(x))}
-        $$
+        $
 
         See https://github.com/vllm-project/vllm/pull/2336 for a visualization
         of the draft, target, and recovered probability distributions.
@@ -341,10 +344,19 @@ class RejectionSampler(SpecDecodeStochasticBaseSampler):
             division-by-zero errors, so we use self._smallest_positive_value to
             avoid that. This introduces some drift to the distribution.
         """
-        _, k, _ = draft_probs.shape
+        batch_size, k, vocab_size = target_probs.shape
 
         # shape [batch_size, k, vocab_size]
-        difference = target_probs - draft_probs
+        batch_indices = torch.arange(batch_size,
+                                     device=target_probs.device)[:, None]
+        probs_indices = torch.arange(k, device=target_probs.device)
+        
+        # Create a copy of draft_probs expanded to full vocab size
+        expanded_draft_probs = torch.zeros_like(target_probs)
+        expanded_draft_probs[batch_indices, probs_indices, draft_token_ids] = draft_probs
+
+        # shape [batch_size, k, vocab_size]
+        difference = target_probs - expanded_draft_probs
 
         # TODO(cade): Can we use logprobs instead of probs, and avoid the
         # division-by-zero errors without introducing distribution drift?

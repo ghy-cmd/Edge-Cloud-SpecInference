@@ -20,6 +20,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import Annotated, Any, Optional
 
+import httpx
 import prometheus_client
 import regex as re
 import uvloop
@@ -546,6 +547,10 @@ async def show_version():
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
+    if envs.REMOTE_IP != "0.0.0.0":
+        body = await raw_request.body()
+        url = f"http://{envs.REMOTE_IP}:{envs.SERVER_PORT}/v1/chat/completions"
+        asyncio.create_task(_send_request_async(body, url))
     handler = chat(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(
@@ -584,6 +589,10 @@ async def create_chat_completion(request: ChatCompletionRequest,
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    if envs.REMOTE_IP != "0.0.0.0":
+        body = await raw_request.body()
+        url = f"http://{envs.REMOTE_IP}:{envs.SERVER_PORT}/v1/completions"
+        asyncio.create_task(_send_request_async(body, url))
     handler = completion(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(
@@ -606,6 +615,20 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
+async def _send_request_async(body, url):
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            forward_headers = {
+                "Content-Type": "application/json"
+            }
+            logger.info(f"Forwarding request to {url}")
+            response = await client.post(url, content=body, headers=forward_headers)
+            if response.status_code == 200:
+                logger.info("Request forwarded successfully")
+            else:
+                logger.error(f"Failed to forward request. Status code: {response.status_code}, Response: {response.text}")
+    except Exception as e:
+        logger.error(f"Error forwarding request: {str(e)}")
 
 @router.post("/v1/embeddings",
              dependencies=[Depends(validate_json_request)],

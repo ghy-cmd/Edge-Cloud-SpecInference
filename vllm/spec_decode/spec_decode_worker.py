@@ -4,6 +4,8 @@
 import copy
 from collections import defaultdict
 from functools import cached_property
+import pickle
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 import torch
@@ -38,6 +40,8 @@ from vllm.spec_decode.metrics import AsyncMetricsCollector
 from vllm.spec_decode.mlp_speculator_worker import MLPSpeculatorWorker
 from vllm.spec_decode.mqa_scorer import MQAScorer
 from vllm.spec_decode.multi_step_worker import MultiStepWorker
+from vllm.spec_decode.remote_target_worker import RemoteTargetWorker
+from vllm.spec_decode.remote_draft_worker import RemoteDraftWorker
 from vllm.spec_decode.ngram_worker import NGramWorker
 from vllm.spec_decode.proposer_worker_base import ProposerWorkerBase
 from vllm.spec_decode.smaller_tp_proposer_worker import SmallerTpProposerWorker
@@ -49,6 +53,9 @@ from vllm.spec_decode.util import (Timer, create_logprobs_output,
                                    split_batch_by_proposal_len)
 from vllm.utils import resolve_obj_by_qualname
 from vllm.worker.worker_base import LoRANotSupportedWorkerBase, WorkerBase
+from vllm.spec_decode.PersistentTCP import PersistentTCPClient, PersistentTCPServer
+import socket
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -66,18 +73,21 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
                                   "incompatible with pipeline parallelism")
 
     draft_worker_kwargs = kwargs.copy()
-
     kwargs["model_runner_cls"] = TargetModelRunner
-    target_worker_config = copy.deepcopy(vllm_config)
-    target_worker_config.parallel_config.worker_cls =\
-        target_worker_config.parallel_config.sd_worker_cls
-    cls = resolve_obj_by_qualname(
-        target_worker_config.parallel_config.worker_cls)
-    target_worker = cls(*args, **kwargs)
-    # Set the disable_logprobs variable in the TargetModelRunner instance
-    # as per its value specified in the SpeculativeConfig.
-    target_worker.model_runner.disable_logprobs =\
-         speculative_config.disable_logprobs
+    if not speculative_config.remote_target:
+        target_worker_config = copy.deepcopy(vllm_config)
+        target_worker_config.parallel_config.worker_cls =\
+            target_worker_config.parallel_config.sd_worker_cls
+        cls = resolve_obj_by_qualname(
+            target_worker_config.parallel_config.worker_cls)
+        target_worker = cls(*args, **kwargs)
+        # Set the disable_logprobs variable in the TargetModelRunner instance
+        # as per its value specified in the SpeculativeConfig.
+        target_worker.model_runner.disable_logprobs =\
+            speculative_config.disable_logprobs
+    else:
+        cls = resolve_obj_by_qualname('vllm.spec_decode.remote_target_worker.RemoteTargetWorker')
+        target_worker = cls(*args, **kwargs)
 
     draft_worker_config = copy.deepcopy(vllm_config)
     draft_worker_config.model_config = speculative_config.draft_model_config
@@ -110,6 +120,8 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         disable_logprobs=speculative_config.disable_logprobs,
         disable_log_stats=speculative_config.disable_log_stats,
         num_speculative_tokens=speculative_config.num_speculative_tokens,
+        remote_target=speculative_config.remote_target,
+        remote_draft=speculative_config.remote_draft,
     )
 
     return spec_decode_worker
@@ -156,6 +168,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         disable_logprobs: bool,
         disable_log_stats: bool,
         num_speculative_tokens: int,
+        remote_target: bool,
+        remote_draft: bool,
     ) -> "SpecDecodeWorker":
 
         allow_zero_draft_token_step = True
@@ -176,9 +190,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                                   ngram_prompt_lookup_max)
         else:
             draft_tp = draft_parallel_config.tensor_parallel_size
-            target_tp = scorer_worker.parallel_config.tensor_parallel_size
+            target_tp = None if remote_target else scorer_worker.parallel_config.tensor_parallel_size 
 
-            if draft_model_config.hf_config.model_type == "mlp_speculator":
+            if remote_draft:
+                proposer_worker = RemoteDraftWorker(**draft_worker_kwargs)
+            elif draft_model_config.hf_config.model_type == "mlp_speculator":
                 proposer_worker = MLPSpeculatorWorker(**draft_worker_kwargs)
             elif draft_model_config.hf_config.model_type == "medusa":
                 proposer_worker = MedusaWorker(**draft_worker_kwargs)
@@ -203,9 +219,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                 if draft_model_config.hf_config.model_type == "deepseek_mtp":
                     num_spec_prefill_steps = \
                         draft_model_config.hf_config.n_predict
-
-            proposer_worker = SmallerTpProposerWorker.maybe_wrap_worker(
-                proposer_worker, draft_tp, target_tp)
+            if not remote_target and not remote_draft:
+                proposer_worker = SmallerTpProposerWorker.maybe_wrap_worker(
+                    proposer_worker, draft_tp, target_tp)
 
         logger.info("Configuring SpecDecodeWorker with proposer=%s",
                     type(proposer_worker))
@@ -224,7 +240,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             " SpecDecodeWorker with sampler=%s", type(spec_decode_sampler))
 
         if not disable_mqa_scorer:
-            if scorer_worker.model_runner.attn_backend.get_name(
+            if not remote_target and scorer_worker.model_runner.attn_backend.get_name(
             ) != "FLASH_ATTN":
                 disable_mqa_scorer = True
                 logger.info(
@@ -240,7 +256,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                     "draft model max_model_len is smaller than the target "
                     "model max_model_len.")
 
-            if not scorer_worker.model_runner.model_config.enforce_eager:
+            if not remote_target and not scorer_worker.model_runner.model_config.enforce_eager:
                 disable_mqa_scorer = True
                 logger.info(
                     "[Speculative Decoding] Disabling MQA scorer as the "
@@ -256,7 +272,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             spec_decode_sampler=spec_decode_sampler,
             allow_zero_draft_token_step=allow_zero_draft_token_step,
             enable_lm_head_weight_load=enable_lm_head_weight_load,
-            num_spec_prefill_steps=num_spec_prefill_steps)
+            num_spec_prefill_steps=num_spec_prefill_steps,
+            remote_target=remote_target,
+            remote_draft=remote_draft,)
 
     def __init__(
         self,
@@ -271,6 +289,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         allow_zero_draft_token_step: Optional[bool] = True,
         enable_lm_head_weight_load: Optional[bool] = False,
         num_spec_prefill_steps: int = 1,
+        remote_target: bool = False,
+        remote_draft: bool = False,
     ):
         """
         Create a SpecDecodeWorker.
@@ -342,19 +362,52 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         self._disable_log_stats = disable_log_stats
         self._num_spec_prefill_steps = num_spec_prefill_steps
 
+        self.remote_target = remote_target
+        self.remote_draft = remote_draft
+        self.tcp_client = None
+        self.tcp_server = None
+
+        # 端侧时间
+        if self.remote_target:
+            self._avg_proposal_time = 0.0
+            self._avg_recv_verify_time = 0.0
+            self.proposal_size = 0
+
+            self._prefill_time = 0.0
+            self._rec_token_time = 0.0
+            self.tcp_client = PersistentTCPClient(ip=envs.REMOTE_IP, port=int(envs.TCP_PORT))
+            self.tcp_client.ensure_connected()
+            
+
+        if self.remote_draft:
+            self._avg_recv_proposal_time = 0.0
+            self._avg_score_time = 0.0
+            self.verify_size = 0
+
+            self._prefill_time = 0.0
+            self.bonus_size = 0
+            self.tcp_server = PersistentTCPServer(ip=envs.REMOTE_IP, port=int(envs.TCP_PORT))
+            self.tcp_server.accept()
+
+        self._decode_time = 0
+
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
         """
         # The scorer worker model is initialized first in case the proposer
         # model has a smaller TP degree than the target worker.
-        self.scorer_worker.init_device()
-        self.proposer_worker.init_device()
+        if not self.remote_target:
+            self.scorer_worker.init_device()
+        if not self.remote_draft:
+            self.proposer_worker.init_device()
 
         # NOTE(cade): load_model is not part of the WorkerBase interface.
-        self.scorer_worker.load_model()
-        self.proposer_worker.load_model()
+        if not self.remote_target:
+            self.scorer_worker.load_model()
+        if not self.remote_draft:
+            self.proposer_worker.load_model()
 
-        if self._enable_lm_head_weight_load:
+        if not self.remote_target and not self.remote_draft and self._enable_lm_head_weight_load:
             # NOTE(Shangming): gather lm_head weight when tp enabled
             target_lm_head_weight: torch.Tensor = tensor_model_parallel_gather(
                 self.scorer_worker.model_runner.model_runner.model.lm_head.\
@@ -411,12 +464,14 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         NOTE(cade): This will require a special check if the proposer worker
         does not have a sampler (e.g. ngram speculation).
         """
-        (self.scorer_worker.model_runner.sampler.include_gpu_probs_tensor
-         ) = True
-        (self.scorer_worker.model_runner.sampler.
-         should_modify_greedy_probs_inplace) = True
-        self.proposer_worker.set_include_gpu_probs_tensor()
-        self.proposer_worker.set_should_modify_greedy_probs_inplace()
+        if not self.remote_target:
+            (self.scorer_worker.model_runner.sampler.include_gpu_probs_tensor
+            ) = True
+            (self.scorer_worker.model_runner.sampler.
+            should_modify_greedy_probs_inplace) = True
+        if not self.remote_draft:
+            self.proposer_worker.set_include_gpu_probs_tensor()
+            self.proposer_worker.set_should_modify_greedy_probs_inplace()
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of cache blocks to use.
@@ -426,27 +481,44 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         scorer cache is divided evenly between the proposer and scorer model KV,
         such that the number of blocks is equal in both KV caches.
         """
-        num_gpu_blocks, num_cpu_blocks = (
-            self.scorer_worker.determine_num_available_blocks())
+        if not self.remote_target and not self.remote_draft:
+            num_gpu_blocks, num_cpu_blocks = (
+                self.scorer_worker.determine_num_available_blocks())
 
-        scorer_cache_block_size_bytes = (
-            self.scorer_worker.get_cache_block_size_bytes())
-        proposer_cache_block_size_bytes = (
-            self.proposer_worker.get_cache_block_size_bytes())
+            scorer_cache_block_size_bytes = (
+                self.scorer_worker.get_cache_block_size_bytes())
+            proposer_cache_block_size_bytes = (
+                self.proposer_worker.get_cache_block_size_bytes())
 
-        new_num_gpu_blocks = split_num_cache_blocks_evenly(
-            scorer_cache_block_size_bytes, proposer_cache_block_size_bytes,
-            num_gpu_blocks)
-        return new_num_gpu_blocks, num_cpu_blocks
+            new_num_gpu_blocks = split_num_cache_blocks_evenly(
+                scorer_cache_block_size_bytes, proposer_cache_block_size_bytes,
+                num_gpu_blocks)
+            return new_num_gpu_blocks, num_cpu_blocks
+        elif self.remote_target:
+            num_gpu_blocks, num_cpu_blocks = (
+                self.proposer_worker.determine_num_available_blocks())
+            # For remote target, we assume the proposer worker does not use
+            proposer_cache_block_size_bytes = (
+                self.proposer_worker.get_cache_block_size_bytes())
+            return num_gpu_blocks, num_cpu_blocks
+        elif self.remote_draft:
+            num_gpu_blocks, num_cpu_blocks = (
+                self.scorer_worker.determine_num_available_blocks())
+            # For remote draft, we assume the scorer worker does not use
+            proposer_cache_block_size_bytes = (
+                self.scorer_worker.get_cache_block_size_bytes())
+            return num_gpu_blocks, num_cpu_blocks
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
         """Initialize the cache engine of the scorer and proposer workers.
         """
-        self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                            num_cpu_blocks=num_cpu_blocks)
-        self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                              num_cpu_blocks=num_cpu_blocks)
+        if not self.remote_target:
+            self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
+                                                num_cpu_blocks=num_cpu_blocks)
+        if not self.remote_draft:
+            self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
+                                                num_cpu_blocks=num_cpu_blocks)
 
     def get_model(self) -> nn.Module:
         return self.scorer_worker.get_model()
@@ -670,55 +742,106 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         not called, meaning that the kv-cache in proposer for requests is not
         updated, so they cannot enable spec decode in the rest decoding.
         """
+        if self.remote_target:
+            # 端侧需要执行
+            with Timer() as prefiller:
+                if not skip_proposer:
+                    # We prepare the prefill hidden states here so that there no
+                    # additional complexity in worker for spec_decode vs non_spec_decode
+                    # flow and execute_model doesn't need additional modifications.
+                    execute_model_req.previous_hidden_states = None
+                    for i in range(self._num_spec_prefill_steps):
+                        execute_model_req.spec_step_idx = i
+                        self.proposer_worker.execute_model(execute_model_req)
+            with Timer() as wait_timer: 
+                sampler_output_to_return = self.tcp_client.recv()
+            sampler_output_to_return = pickle.loads(sampler_output_to_return)
+        else:
+            # 云端需要执行
+            with Timer() as prefiller:
+                sampler_output = self.scorer_worker.execute_model(execute_model_req)
+            
+                assert len(sampler_output) == 1
+                sampler_output = sampler_output[0]
+                # Store hidden states from target model execution, BxD.
+                hidden_states = sampler_output.hidden_states
+                if hidden_states is not None:
+                    # Only decodes and prefill terminal chunks need a hidden state.
+                    seq_group_meta_with_hidden = [
+                        sg for sg in execute_model_req.seq_group_metadata_list
+                        if sg.do_sample
+                    ]
+                    if any(seq.is_prompt for seq in seq_group_meta_with_hidden):
+                        # Drop hidden_states with no prediction (eg non-terminal chunks)
+                        hidden_states = hidden_states[
+                            torch.where(sampler_output.sampled_token_ids -
+                                        VLLM_INVALID_TOKEN_ID)[0]]
+                    if self.previous_hidden_states is None and len(
+                            seq_group_meta_with_hidden):
+                        self.previous_hidden_states = HiddenStates(
+                            hidden_states, seq_group_meta_with_hidden)
+                    elif self.previous_hidden_states and len(
+                            seq_group_meta_with_hidden):
+                        self.previous_hidden_states.update(hidden_states,
+                                                        seq_group_meta_with_hidden)
+                        self.previous_hidden_states.prune(seq_group_meta_with_hidden)
 
-        sampler_output = self.scorer_worker.execute_model(execute_model_req)
-        assert len(sampler_output) == 1
-        sampler_output = sampler_output[0]
+                if not skip_proposer and self.remote_target:
+                    # We prepare the prefill hidden states here so that there no
+                    # additional complexity in worker for spec_decode vs non_spec_decode
+                    # flow and execute_model doesn't need additional modifications.
+                    execute_model_req.previous_hidden_states = \
+                        prepare_prefill_hidden_states(
+                            sampler_output.prefill_hidden_states)
+                    for i in range(self._num_spec_prefill_steps):
+                        execute_model_req.spec_step_idx = i
+                        self.proposer_worker.execute_model(execute_model_req)
 
-        # Store hidden states from target model execution, BxD.
-        hidden_states = sampler_output.hidden_states
-        if hidden_states is not None:
-            # Only decodes and prefill terminal chunks need a hidden state.
-            seq_group_meta_with_hidden = [
-                sg for sg in execute_model_req.seq_group_metadata_list
-                if sg.do_sample
-            ]
-            if any(seq.is_prompt for seq in seq_group_meta_with_hidden):
-                # Drop hidden_states with no prediction (eg non-terminal chunks)
-                hidden_states = hidden_states[
-                    torch.where(sampler_output.sampled_token_ids -
-                                VLLM_INVALID_TOKEN_ID)[0]]
-            if self.previous_hidden_states is None and len(
-                    seq_group_meta_with_hidden):
-                self.previous_hidden_states = HiddenStates(
-                    hidden_states, seq_group_meta_with_hidden)
-            elif self.previous_hidden_states and len(
-                    seq_group_meta_with_hidden):
-                self.previous_hidden_states.update(hidden_states,
-                                                   seq_group_meta_with_hidden)
-                self.previous_hidden_states.prune(seq_group_meta_with_hidden)
+                sampler_output_to_return = (self._serialize_sampler_output_no_logprobs(
+                    execute_model_req=execute_model_req, sampler_output=sampler_output)
+                                            if self._disable_logprobs else
+                                            [sampler_output])
 
-        if not skip_proposer:
-            # We prepare the prefill hidden states here so that there no
-            # additional complexity in worker for spec_decode vs non_spec_decode
-            # flow and execute_model doesn't need additional modifications.
-            execute_model_req.previous_hidden_states = \
-                prepare_prefill_hidden_states(
-                    sampler_output.prefill_hidden_states)
-            for i in range(self._num_spec_prefill_steps):
-                execute_model_req.spec_step_idx = i
-                self.proposer_worker.execute_model(execute_model_req)
+                # Clear device tensors from sampler output. This reduces communication
+                # overhead when the engine runs in a different process than the workers.
+                sampler_output.sampled_token_probs = None
+                sampler_output.sampled_token_ids = None
+                sampler_output.logprobs = None
 
-        sampler_output_to_return = (self._serialize_sampler_output_no_logprobs(
-            execute_model_req=execute_model_req, sampler_output=sampler_output)
-                                    if self._disable_logprobs else
-                                    [sampler_output])
+            if self.remote_draft:
+                data = pickle.dumps(sampler_output_to_return)
+                bonus_size = len(data)
+                self.tcp_server.send(data)
+                
+        if self.remote_target:
+            self._prefill_time = prefiller.elapsed_time_ms
+            self._rec_token_time = wait_timer.elapsed_time_ms
+            logger.info(
+                "【端侧PREFILL】\n"
+                "Prefill时间=%.2fms\n"
+                "Prefill RECV=%.2fms\n",
+                self._prefill_time,
+                self._rec_token_time,
+            )
 
-        # Clear device tensors from sampler output. This reduces communication
-        # overhead when the engine runs in a different process than the workers.
-        sampler_output.sampled_token_probs = None
-        sampler_output.sampled_token_ids = None
-        sampler_output.logprobs = None
+            self._avg_proposal_time = 0.0
+            self._avg_recv_verify_time = 0.0
+            
+        elif self.remote_draft:
+            self._prefill_time = prefiller.elapsed_time_ms
+            self.bonus_size = bonus_size
+            logger.info(
+                "【云侧PREFILL】\n"
+                "Prefill时间=%.2fms\n"
+                "Bonus Token数据大小=%d bytes (%.2f KB)",
+                self._prefill_time,
+                self.bonus_size,
+                self.bonus_size / 1024.0
+            )
+            self._avg_recv_proposal_time = 0.0
+            self._avg_score_time = 0.0
+
+        self._decode_time = 0
         return sampler_output_to_return
 
     def _run_non_driver_rank(self) -> bool:
@@ -780,8 +903,21 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         execute_model_req.previous_hidden_states = self.previous_hidden_states
         self.previous_hidden_states = None
 
-        with Timer() as proposal_timer:
-            # Generate proposals using draft worker.
+        
+        # Generate proposals using draft worker.
+        if self.remote_draft:
+            with Timer() as proposal_timer:
+                received_data=self.tcp_server.recv()
+            proposals = pickle.loads(received_data)
+            proposals.to(self.device)
+        elif self.remote_target:
+            with Timer() as proposal_timer:
+                proposals = self.proposer_worker.get_spec_proposals(
+                    execute_model_req, self._seq_with_bonus_token_in_last_step)
+            data = pickle.dumps(proposals)
+            proposal_size = len(data)
+            self.tcp_client.send(data)
+        else:
             proposals = self.proposer_worker.get_spec_proposals(
                 execute_model_req, self._seq_with_bonus_token_in_last_step)
 
@@ -792,48 +928,118 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
         execute_model_req.previous_hidden_states = None
 
-        with Timer() as scoring_timer:
-            proposal_scores = self.scorer.score_proposals(
-                execute_model_req,
-                proposals,
+        if self.remote_target:
+            with Timer() as wait_res_timer:
+                data_recv=self.tcp_client.recv()
+            sampler_output_to_return, self._seq_with_bonus_token_in_last_step = pickle.loads(data_recv)
+        else:
+            with Timer() as scoring_timer:
+                proposal_scores = self.scorer.score_proposals(
+                        execute_model_req,
+                        proposals,
+                    )
+            
+                _, (non_spec_seqs, non_spec_indices) = split_batch_by_proposal_len(
+                    execute_model_req.seq_group_metadata_list, proposals.proposal_lens)
+                
+                # With prefill chunking enabled, `non_spec_seqs` contains prefills too:
+                # discard decodes that have already been processed by proposer.
+                non_spec_indices = [
+                    idx for idx in non_spec_indices
+                    if execute_model_req.seq_group_metadata_list[idx].is_prompt
+                ]
+                if len(non_spec_indices):
+                    all_hidden_states = proposal_scores.hidden_states
+                    if all_hidden_states is not None:
+                        prefill_hidden_states = all_hidden_states[non_spec_indices]
+                        execute_model_req.previous_hidden_states = \
+                            prepare_prefill_hidden_states(prefill_hidden_states)
+                    # Sync proposer KV cache for prefills.
+                    prefill_req = execute_model_req.clone(non_spec_seqs)
+                    # TODO avoid sampling here?
+                    self.proposer_worker.execute_model(prefill_req)
+
+            
+                accepted_token_ids, target_logprobs = self._verify_tokens(
+                    execute_model_req.seq_group_metadata_list, proposal_scores,
+                    proposals, execute_model_req.num_lookahead_slots)
+
+                stage_times = (proposal_timer.elapsed_time_ms / num_lookahead_slots,
+                            0.0,
+                            0.0)
+                sampler_output_to_return = self._create_output_sampler_list(
+                    execute_model_req.seq_group_metadata_list,
+                    accepted_token_ids,
+                    target_logprobs=target_logprobs,
+                    prompt_logprobs=proposal_scores.prompt_logprobs
+                    if not self._disable_logprobs else None,
+                    k=execute_model_req.num_lookahead_slots,
+                    stage_times=stage_times)
+            
+            if self.remote_draft:
+                data = pickle.dumps((sampler_output_to_return,self._seq_with_bonus_token_in_last_step))
+                verify_size = len(data)
+                self.tcp_server.send(data)
+        if self.remote_target:
+            self._log_local_status(proposal_timer.elapsed_time_ms,wait_res_timer.elapsed_time_ms, proposal_size)
+        elif self.remote_draft:
+            self._log_remote_status(proposal_timer.elapsed_time_ms, scoring_timer.elapsed_time_ms, verify_size)
+        return sampler_output_to_return
+    
+    def _log_local_status(
+            self, proposal_time,
+            recv_verify_time,
+            proposal_size,
+    )-> None:
+        self._avg_proposal_time = (self._avg_proposal_time * self._decode_time + proposal_time)/(self._decode_time + 1)
+        self._avg_recv_verify_time = (self._avg_recv_verify_time * self._decode_time + recv_verify_time)/(self._decode_time + 1)
+        self.proposal_size = (self.proposal_size * self._decode_time + proposal_size)/(self._decode_time + 1)
+        self._decode_time += 1
+        logger.info(
+            "【端侧DECODE】\n"
+            "平均Proposal时间=%.2fms\n"
+            "等待接收Verify时间=%.2fms\n"
+            "Proposal数据大小为%d bytes (%.2f KB)\n",
+            self._avg_proposal_time,
+            self._avg_recv_verify_time,
+            self.proposal_size,
+            self.proposal_size/1024
+        )
+        logger.info(
+                "【端侧PREFILL】\n"
+                "Prefill时间=%.2fms\n"
+                "Prefill RECV=%.2fms\n",
+                self._prefill_time,
+                self._rec_token_time,
             )
-
-        _, (non_spec_seqs, non_spec_indices) = split_batch_by_proposal_len(
-            execute_model_req.seq_group_metadata_list, proposals.proposal_lens)
-        # With prefill chunking enabled, `non_spec_seqs` contains prefills too:
-        # discard decodes that have already been processed by proposer.
-        non_spec_indices = [
-            idx for idx in non_spec_indices
-            if execute_model_req.seq_group_metadata_list[idx].is_prompt
-        ]
-        if len(non_spec_indices):
-            all_hidden_states = proposal_scores.hidden_states
-            if all_hidden_states is not None:
-                prefill_hidden_states = all_hidden_states[non_spec_indices]
-                execute_model_req.previous_hidden_states = \
-                    prepare_prefill_hidden_states(prefill_hidden_states)
-            # Sync proposer KV cache for prefills.
-            prefill_req = execute_model_req.clone(non_spec_seqs)
-            # TODO avoid sampling here?
-            self.proposer_worker.execute_model(prefill_req)
-
-        with Timer() as verification_timer:
-            accepted_token_ids, target_logprobs = self._verify_tokens(
-                execute_model_req.seq_group_metadata_list, proposal_scores,
-                proposals, execute_model_req.num_lookahead_slots)
-
-        stage_times = (proposal_timer.elapsed_time_ms / num_lookahead_slots,
-                       scoring_timer.elapsed_time_ms,
-                       verification_timer.elapsed_time_ms)
-
-        return self._create_output_sampler_list(
-            execute_model_req.seq_group_metadata_list,
-            accepted_token_ids,
-            target_logprobs=target_logprobs,
-            prompt_logprobs=proposal_scores.prompt_logprobs
-            if not self._disable_logprobs else None,
-            k=execute_model_req.num_lookahead_slots,
-            stage_times=stage_times)
+    
+    def _log_remote_status(
+            self, recv_proposal_time,
+            score_time,
+            verify_size,
+    )-> None:
+        self._avg_recv_proposal_time = (self._avg_recv_proposal_time * self._decode_time + recv_proposal_time)/(self._decode_time + 1)
+        self._avg_score_time = (self._avg_score_time * self._decode_time + score_time)/(self._decode_time + 1)
+        self.verify_size = (self.verify_size * self._decode_time + verify_size)/(self._decode_time + 1)
+        self._decode_time += 1
+        logger.info(
+            "【云侧DECODE】\n"
+            "等待接收Proposal时间=%.2fms\n"
+            "平均Score时间=%.2fms\n"
+            "Verify数据大小为%d bytes (%.2f KB)\n",
+            self._avg_recv_proposal_time,
+            self._avg_score_time,
+            self.verify_size,
+            self.verify_size/1024.0
+        )
+        logger.info(
+                "【云侧PREFILL】\n"
+                "Prefill时间=%.2fms\n"
+                "Bonus Token数据大小=%d bytes (%.2f KB)",
+                self._prefill_time,
+                self.bonus_size,
+                self.bonus_size / 1024.0
+            )
 
     @nvtx_range("spec_decode_worker._verify_tokens")
     def _verify_tokens(
@@ -869,6 +1075,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         bonus_token_ids = proposal_scores.token_ids[spec_indices, -1:]
 
         # Get probabilities according to proposal method.
+        # For the optimized format, proposal_probs has shape [batch_size, k]
         proposal_probs = proposals.proposal_probs[spec_indices]
 
         # Get proposed tokens.
@@ -1109,7 +1316,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         """Log the speculative stage times. If stat logging is disabled, do
         nothing.
         """
-        if self._disable_log_stats:
+        if self._disable_log_stats or self.remote_draft or self.remote_target:
             return
 
         logger.info(
@@ -1266,6 +1473,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
     @property
     def device(self):
+        if self.remote_target:
+            return self.proposer_worker.device
         return self.scorer_worker.device
 
     @property
@@ -1290,6 +1499,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         if isinstance(self.scorer_worker, WorkerBase):
             self.scorer_worker.stop_profile()
 
+    def __del__(self):
+        if self.tcp_client:
+            self.tcp_client.close()
+        if self.tcp_server:
+            self.tcp_server.close()
 
 def split_num_cache_blocks_evenly(scorer_cache_block_size_bytes: int,
                                   proposer_cache_block_size_bytes: int,

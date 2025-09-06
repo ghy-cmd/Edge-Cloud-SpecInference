@@ -2403,6 +2403,13 @@ class SpeculativeConfig:
     """Disable speculative decoding for new incoming requests when the number
     of enqueued requests is larger than this value, if provided."""
 
+    remote_target: bool = False
+    """If True, the target model is running on a remote server. This is used to
+    determine whether to use the `RemoteTargetModel` for speculative decoding."""
+    remote_draft: bool = False
+    """If True, the draft model is running on a remote server. This is used to
+    determine whether to use the `RemoteDraftModel` for speculative decoding."""
+
     # Ngram proposer configuration
     prompt_lookup_max: Optional[int] = None
     """Maximum size of ngram token window when using Ngram proposer, required

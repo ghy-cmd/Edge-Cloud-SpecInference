@@ -126,6 +126,10 @@ if TYPE_CHECKING:
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_SLEEP_WHEN_IDLE: bool = False
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
+    REMOTE_IP: str = "0.0.0.0"
+    LOCAL_IP: str = "0.0.0.0"
+    TCP_PORT: str = "8080"
+    SERVER_PORT: str = "8081"
 
 
 def get_default_cache_root():
@@ -864,6 +868,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # processes via zmq.
     "VLLM_MQ_MAX_CHUNK_BYTES_MB":
     lambda: int(os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")),
+
+    "REMOTE_IP":
+    lambda: str(os.getenv("REMOTE_IP", "0.0.0.0")),
+
+    "LOCAL_IP":
+    lambda: str(os.getenv("LOCAL_IP", "0.0.0.0")),
+
+    "TCP_PORT":
+    lambda: str(os.getenv("TCP_PORT", "8080")),
+
+    "SERVER_PORT":
+    lambda: str(os.getenv("SERVER_PORT", "8081")),
 }
 
 # --8<-- [end:env-vars-definition]

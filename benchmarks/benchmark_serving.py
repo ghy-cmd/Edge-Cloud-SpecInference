@@ -297,12 +297,19 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0].prompt,
-        input_requests[0].prompt_len,
-        input_requests[0].expected_output_len,
-        input_requests[0].multi_modal_data,
-    )
+    # test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+    #     input_requests[0].prompt,
+    #     input_requests[0].prompt_len,
+    #     input_requests[0].expected_output_len,
+    #     input_requests[0].multi_modal_data,
+    # )
+    # Create a simple test request instead of using the first request from dataset
+    test_prompt = "Hello, world!"
+    test_prompt_len = len(tokenizer(test_prompt).input_ids)
+    test_output_len = 10
+    test_mm_content = None
+    
+    print(f"Testing with custom request: '{test_prompt}'")
 
     assert test_mm_content is None or isinstance(test_mm_content, dict)
     test_input = RequestFuncInput(

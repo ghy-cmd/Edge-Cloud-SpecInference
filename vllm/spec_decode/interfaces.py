@@ -21,6 +21,8 @@ class SpeculativeProposals:
     proposal_token_ids: torch.Tensor
 
     # Probabilities of the proposal tokens according to the proposer.
+    # For optimization, we only keep probabilities for the proposed tokens
+    # instead of the full vocabulary distribution.
     proposal_probs: torch.Tensor
 
     # The valid length of each proposal; can be zero.
@@ -34,6 +36,13 @@ class SpeculativeProposals:
                 f"proposal_token_ids={self.proposal_token_ids}, "
                 f"proposal_probs={self.proposal_probs.shape}, "
                 f"proposal_lens={self.proposal_lens})")
+    
+    def to(self,device):
+        """Move the proposal tensors to the specified device."""
+        self.proposal_token_ids = self.proposal_token_ids.to(device)
+        self.proposal_probs = self.proposal_probs.to(device)
+        self.proposal_lens = self.proposal_lens.to(device)
+        return self
 
 
 @dataclass
@@ -65,6 +74,24 @@ class SpeculativeScores:
         return (f"SpeculativeScores("
                 f"probs={self.probs.shape}, "
                 f"token_ids={self.token_ids.shape})")
+    
+    def cpu(self):
+        """Move the scores tensors to CPU."""
+        self.probs = self.probs.cpu()
+        self.logprobs = self.logprobs.cpu()
+        self.token_ids = self.token_ids.cpu()
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states.cpu()
+        return self
+    
+    def npu(self):
+        """Move the scores tensors to NPU."""
+        self.probs = self.probs.npu()
+        self.logprobs = self.logprobs.npu()
+        self.token_ids = self.token_ids.npu()
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states.npu()
+        return self
 
 
 class SpeculativeProposer(ABC):

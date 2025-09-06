@@ -1136,7 +1136,14 @@ class SequenceOutput(
                  and self.output_token == other.output_token)
         log_probs_equal = other.logprobs == self.logprobs
         return equal and log_probs_equal
-
+    
+    def cpu(self):
+        self.output_embed = self.output_embed.cpu() if self.output_embed is not None else None
+        return self
+    
+    def npu(self):
+        self.output_embed = self.output_embed.npu() if self.output_embed is not None else None
+        return self
 
 class SequenceGroupOutput(ABC):
     """The base class for model outputs associated with a sequence group."""
@@ -1171,6 +1178,13 @@ class CompletionSequenceGroupOutput(
         return (self.samples == other.samples
                 and self.prompt_logprobs == other.prompt_logprobs)
 
+    def cpu(self):
+        self.samples = [sample.cpu() for sample in self.samples]
+        return self
+    
+    def npu(self):
+        self.samples = [sample.npu() for sample in self.samples]
+        return self
 
 class PoolingSequenceGroupOutput(
         msgspec.Struct,

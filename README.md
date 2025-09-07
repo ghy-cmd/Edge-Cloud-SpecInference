@@ -9,7 +9,7 @@ Efficient Large Language Model Inference Framework with Edge-Cloud Collaborative
 </h3>
 
 <p align="center">
-| <a href="#about-the-project"><b>About</b></a> | <a href="#key-features"><b>Key Features</b></a> | <a href="#quick-start"><b>Quick Start</b></a> | <a href="#testing"><b>Testing</b></a> | <a href="#windows-wsl-configuration"><b>Windows WSL Configuration</b></a> |
+| <a href="#about-the-project"><b>About</b></a> | <a href="#key-features"><b>Key Features</b></a> | <a href="#quick-start"><b>Quick Start</b></a> | <a href="#testing"><b>Testing</b></a> | <a href="#windows-wsl-configuration"><b>Windows WSL Configuration</b></a> | <a href="README_zh.md"><b>中文</b></a> |
 </p>
 
 ---
